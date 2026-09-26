@@ -79,7 +79,7 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
 
-> 本机未装 Redis 时保持 `.env` 中 `REDIS_URL` 为空即可，登录锁定/令牌黑名单/订单号自增自动降级为进程内内存实现，功能一致。
+> 配置项在 `backend/config.py` 中均有默认值，**不创建 `.env` 也能直接启动**；需要覆盖时把 `backend/.env.example` 复制为 `.env` 再改。本机未装 Redis 时保持 `REDIS_URL` 为空即可，登录锁定/令牌黑名单/订单号自增自动降级为进程内内存实现，功能一致。
 
 3. 启动前端：
 
@@ -95,26 +95,40 @@ npm run dev
 
 ```
 flight-reservation/
+├── README.md
 ├── docker-compose.yml          # MySQL + Redis + 后端 + 前端 一键编排
+├── .gitignore                  # 排除 .venv / node_modules / dist / .env
+├── docs/                       # 架构文档与项目说明
 ├── backend/
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   ├── .env                    # 本地开发配置
-│   └── app/
-│       ├── main.py             # 应用入口（含定时任务启动）
-│       ├── config.py           # 环境配置（pydantic-settings）
-│       ├── models.py           # SQLAlchemy 模型
-│       ├── schemas.py          # Pydantic 入参模型
-│       ├── validators.py       # 用户名/密码/日期/航线校验
-│       ├── security.py         # BCrypt + JWT
-│       ├── redis_client.py     # Redis 封装（可降级内存）
-│       ├── dependencies.py     # 鉴权依赖
-│       ├── exceptions.py       # 业务异常
-│       ├── constants.py        # 错误码 / 状态机 / 提示语
-│       ├── scheduler.py        # 订单自动完成定时任务
-│       ├── seed.py             # 建表 + 初始化数据
-│       ├── services/           # 业务服务层
-│       └── routers/            # 路由层
+│   ├── .env.example            # 配置模板（可选，复制为 .env 后覆盖默认值）
+│   ├── app/
+│   │   ├── main.py             # 应用入口（含定时任务启动）
+│   │   ├── config.py           # 环境配置（pydantic-settings，字段均有默认值）
+│   │   ├── models.py           # SQLAlchemy 模型
+│   │   ├── schemas.py          # Pydantic 入参模型
+│   │   ├── validators.py       # 用户名/密码/日期/航线校验
+│   │   ├── security.py         # BCrypt + JWT
+│   │   ├── redis_client.py     # Redis 封装（可降级内存）
+│   │   ├── dependencies.py     # 鉴权依赖
+│   │   ├── exceptions.py       # 业务异常
+│   │   ├── constants.py        # 错误码 / 状态机 / 提示语
+│   │   ├── scheduler.py        # 订单自动完成定时任务
+│   │   ├── seed.py             # 建表 + 初始化数据（三舱票价按距离计算）
+│   │   ├── services/           # 业务服务层
+│   │   └── routers/            # 路由层
+│   └── sql/
+│       ├── schema.sql          # 建表 DDL
+│       ├── pricing.py          # 统一计价：距离 → 三舱价格
+│       ├── coords.py           # 城市经纬度（计价用）
+│       ├── cities_data.py      # 225 城省份归属（生成）
+│       ├── flights_fill.py     # 支线航线（生成）
+│       ├── generate_cities.py  # 城市数据生成脚本
+│       ├── _gen_fill.py        # 支线航线生成脚本
+│       ├── migrate.py          # 迁移脚本
+│       ├── check_coords.py     # 经纬度校验
+│       └── check_flights.py    # 航线覆盖校验
 └── frontend/
     ├── Dockerfile
     ├── nginx.conf              # 静态托管 + /api 反代
