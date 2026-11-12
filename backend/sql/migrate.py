@@ -5,12 +5,13 @@
 - 重建业务基础数据（城市/航班按新种子；用户与管理账号保留）
 运行：python -m sql.migrate  （在 backend 目录下）
 """
+import pathlib
 import sys
 
 
 def main():
-    sys.path.insert(0, r"e:\项目1\1\flight-reservation\backend")
-    from sqlalchemy import text
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    from sqlalchemy import inspect, text
 
     from app.database import SessionLocal, engine
     from app.seed import init_schema, seed_if_empty
@@ -18,12 +19,10 @@ def main():
     init_schema()
 
     with engine.connect() as conn:
-        cols = {row[0] for row in conn.execute(text("SHOW COLUMNS FROM city"))}
+        cols = {c["name"] for c in inspect(conn).get_columns("city")}
     if "province" not in cols:
         with engine.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE city ADD COLUMN `province` VARCHAR(64) NOT NULL DEFAULT '' AFTER `city_name`"
-            ))
+            conn.execute(text("ALTER TABLE city ADD COLUMN province VARCHAR(64) NOT NULL DEFAULT ''"))
         print("已补充 city.province 列")
     else:
         print("city.province 列已存在")

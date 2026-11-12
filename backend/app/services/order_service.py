@@ -2,6 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from .. import constants, validators
 from ..dependencies import order_not_found
@@ -25,6 +26,22 @@ def _city_by_code(db: Session, code: str) -> City | None:
 def _unit_price(flight: Flight, seat_class: str) -> float:
     field = constants.SEAT_PRICE_FIELD[seat_class]
     return float(getattr(flight, field))
+
+
+def _take_seats(db: Session, flight_id: int, count: int) -> bool:
+    """原子扣减余票：条件更新，并发下不会超卖。"""
+    affected = db.query(Flight).filter(
+        Flight.id == flight_id,
+        Flight.seat_remain >= count,
+    ).update({Flight.seat_remain: Flight.seat_remain - count}, synchronize_session=False)
+    return bool(affected)
+
+
+def _release_seats(db: Session, flight_id: int, count: int):
+    """回补余票（取消、改单减少票数、改签航班时使用）。"""
+    db.query(Flight).filter(Flight.id == flight_id).update(
+        {Flight.seat_remain: Flight.seat_remain + count}, synchronize_session=False
+    )
 
 
 def _write_status_log(db: Session, order: Order, from_status: str | None, to_status: str,
@@ -111,11 +128,11 @@ def create_order(db: Session, user_id: int, payload) -> dict:
     if not passenger_name:
         raise BizException(3013)
 
-    if flight.seat_remain < ticket_count:
-        raise BizException(3014)
-
     unit_price = _unit_price(flight, seat_class)
     total_price = unit_price * ticket_count
+
+    if not _take_seats(db, flight.id, ticket_count):
+        raise BizException(3014)
 
     order_no = _generate_order_no(db)
     order = Order(
@@ -240,7 +257,11 @@ def _find_flight_for_route(db: Session, from_city: City, to_city: City, flight_n
 
 
 def update_order(db: Session, user_id: int, order_no: str, payload) -> dict:
-    """更新订单（OR-18 ~ OR-22）：仅已出票且航班日期未到的订单可修改，乐观锁防并发覆盖。"""
+    """更新订单（OR-18 ~ OR-22）：仅已出票且航班日期未到的订单可修改。
+
+    并发安全分两层：余票用条件更新原子增减，订单行用 version 乐观锁，
+    若读取后被其他请求改过，提交时抛 3015 而不是静默覆盖。
+    """
     order = db.query(Order).filter(Order.order_no == order_no, Order.user_id == user_id).first()
     if not order:
         order_not_found()
@@ -249,20 +270,22 @@ def update_order(db: Session, user_id: int, order_no: str, payload) -> dict:
     if order.status != "TICKETED" or order.flight_date <= validators.today():
         raise BizException(3005)
 
+    old_flight_id = order.flight_id
+    old_count = order.ticket_count
     old_from = _city_of(db, order.from_city_id)
     old_to = _city_of(db, order.to_city_id)
-    from_city = old_from
-    to_city = old_to
-    flight = _flight_of(db, order.flight_id)
 
+    # 先把所有变更校验完并取值，最后统一写库，避免中途抛错留下半更新状态
+    new_flight_date = order.flight_date
     if payload.flightDate is not None:
-        flight_date, date_code = validators.validate_flight_date(payload.flightDate)
+        new_flight_date, date_code = validators.validate_flight_date(payload.flightDate)
         if date_code == 3001:
             raise BizException(3001, f"此日期后的航班日期有效{validators.format_date(validators.today())}")
         if date_code:
             raise BizException(date_code)
-        order.flight_date = flight_date
 
+    from_city, to_city = old_from, old_to
+    flight = _flight_of(db, old_flight_id)
     if payload.fromCity is not None or payload.toCity is not None:
         new_from_code = payload.fromCity or old_from.city_code
         new_to_code = payload.toCity or old_to.city_code
@@ -291,37 +314,59 @@ def update_order(db: Session, user_id: int, order_no: str, payload) -> dict:
             raise BizException(3011)
         flight = f
 
-    if payload.passengerName is not None:
-        name = payload.passengerName.strip()
-        if not name:
-            raise BizException(3013)
-        order.passenger_name = name
-
+    new_count = old_count
     if payload.ticketCount is not None:
         if not (1 <= payload.ticketCount <= 9):
             raise BizException(3007)
-        order.ticket_count = payload.ticketCount
+        new_count = payload.ticketCount
 
+    new_seat_class = order.seat_class
     if payload.seatClass is not None:
         seat_class = payload.seatClass.upper()
         if seat_class not in constants.SEAT_CLASSES:
             raise BizException(3012)
-        order.seat_class = seat_class
+        new_seat_class = seat_class
 
-    if flight.seat_remain < order.ticket_count:
-        raise BizException(3014)
+    new_passenger = order.passenger_name
+    if payload.passengerName is not None:
+        name = payload.passengerName.strip()
+        if not name:
+            raise BizException(3013)
+        new_passenger = name
 
-    # 舱位或票数变更后服务端重算并回写（OR-22）
-    order.unit_price = _unit_price(flight, order.seat_class)
-    order.total_price = order.unit_price * order.ticket_count
+    # 余票调整：同航班只动差额；换航班则先占新航班，成功后再释放原航班
+    if flight.id == old_flight_id:
+        delta = new_count - old_count
+        if delta > 0 and not _take_seats(db, flight.id, delta):
+            db.rollback()
+            raise BizException(3014)
+        if delta < 0:
+            _release_seats(db, flight.id, -delta)
+    else:
+        if not _take_seats(db, flight.id, new_count):
+            db.rollback()
+            raise BizException(3014)
+        _release_seats(db, old_flight_id, old_count)
+
+    order.flight_date = new_flight_date
     order.flight_id = flight.id
     order.from_city_id = from_city.id
     order.to_city_id = to_city.id
+    order.passenger_name = new_passenger
+    order.ticket_count = new_count
+    order.seat_class = new_seat_class
+    # 舱位或票数变更后服务端重算并回写（OR-22）
+    order.unit_price = _unit_price(flight, new_seat_class)
+    order.total_price = order.unit_price * new_count
     order.updated_at = datetime.now()
 
     _write_status_log(db, order, order.status, order.status, constants.ACTION_UPDATE,
                       constants.OPERATOR_USER, user_id)
-    db.commit()
+    try:
+        db.commit()
+    except StaleDataError:
+        db.rollback()
+        raise BizException(3015)
     return _order_with_detail(db, order)
 
 
@@ -333,11 +378,18 @@ def cancel_order(db: Session, user_id: int, order_no: str) -> dict:
     if order.status != "TICKETED" or order.flight_date <= validators.today():
         raise BizException(3016)
 
+    # 先回补余票再改状态：条件更新不触发订单行的自动 flush，避免乐观锁提前冲突
+    _release_seats(db, order.flight_id, order.ticket_count)
     _write_status_log(db, order, order.status, "CANCELLED", constants.ACTION_CANCEL,
                       constants.OPERATOR_USER, user_id)
     order.status = "CANCELLED"
     order.updated_at = datetime.now()
-    db.commit()
+    try:
+        db.commit()
+    except StaleDataError:
+        # 并发取消/改单：后到的请求整笔回滚，余票不会被重复回补
+        db.rollback()
+        raise BizException(3015)
     return {"orderNo": order.order_no, "status": "CANCELLED"}
 
 
@@ -352,7 +404,11 @@ def auto_done_orders(db: Session) -> int:
                           constants.OPERATOR_SYSTEM, None)
         order.status = "DONE"
         order.updated_at = datetime.now()
+        try:
+            db.commit()
+        except StaleDataError:
+            # 用户在定时任务执行的同时取消/改单，跳过该单即可
+            db.rollback()
+            continue
         count += 1
-    if count:
-        db.commit()
     return count

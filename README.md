@@ -2,7 +2,7 @@
 
 一套面向终端旅客的在线机票预订平台：旅客自助完成注册登录、航班查询、下单预订与订单管理；管理员通过独立后台维护基础数据并处置异常订单。
 
-本实现依据《航班预订系统项目说明文档（PRD）》与《航班预订系统技术架构文档》开发，后端使用 **Python FastAPI** 替代文档默认的 Java Spring Boot，功能与校验规则完全对齐需求文档。
+本实现依据《航班预订系统项目说明文档（PRD）》与《航班预订系统技术架构文档》开发，后端使用 **Python FastAPI** 替代文档默认的 Java Spring Boot、数据库使用 **SQLite** 替代 MySQL，功能与校验规则完全对齐需求文档。
 
 ---
 
@@ -10,12 +10,12 @@
 
 | 端 | 技术 |
 | --- | --- |
-| 后端 | Python 3.11+ · FastAPI · SQLAlchemy · Pydantic v2 · PyMySQL |
+| 后端 | Python 3.11+ · FastAPI · SQLAlchemy · Pydantic v2 |
 | 认证 | JWT（客户/管理员双密钥）· BCrypt 密码加密 · Redis 令牌黑名单（本地可降级为内存缓存） |
 | 前端 | Vue 3 · Vite · Element Plus · Pinia · Vue Router · Axios |
-| 数据库 | MySQL 8.0（utf8mb4） |
+| 数据库 | SQLite 3（文件型，零配置） |
 | 缓存 | Redis 7（可选，未安装时自动使用内存缓存，功能一致） |
-| 部署 | Docker Compose（MySQL + Redis + 后端 + Nginx 前端） |
+| 部署 | Docker Compose（Redis + 后端 + Nginx 前端，SQLite 数据卷持久化） |
 
 ## 功能清单
 
@@ -26,10 +26,10 @@
 
 ### 订单模块
 - 航班查询：按出发地、目的地、航班日期检索在售航班
-- 新建订单：校验航线、航班、日期（须晚于今天）、票数（1～9）、舱位、乘机人、余票，服务端计价
+- 新建订单：校验航线、航班、日期（须晚于今天）、票数（1～9）、舱位、乘机人、余票，服务端计价；余票以条件更新原子扣减，并发下单不超卖
 - 我的订单：状态筛选（已出票/已完成/已取消）、按订单号/乘机人/航班日期检索、查看详情（含状态流转时间线）
-- 更新订单：仅「已出票」且航班日期未到的订单可改，乐观锁（version）防并发覆盖，改舱位/票数后服务端重算价格
-- 取消订单：非物理删除，状态流转留痕可追溯
+- 更新订单：仅「已出票」且航班日期未到的订单可改，乐观锁（version）防并发覆盖，改舱位/票数后服务端重算价格；改票数只调差额，改签航班先占新航班再释放原航班
+- 取消订单：非物理删除，状态流转留痕可追溯，同时回补该单占用的余票
 - 自动完成：定时任务将航班日期已过且仍为「已出票」的订单置为「已完成」（系统留痕）
 
 ### 管理后台（独立入口 `/admin/login`）
@@ -59,18 +59,9 @@ docker compose up -d --build
 
 > 首次启动会自动建表并初始化 225 个城市（覆盖 34 个省级行政区，含省份归属；仅收录具有民用运输机场的城市）、630 条航班、管理员与演示账号；城市选择器为「先选省份、再选城市」的级联选择，支持输入过滤；每个有机场城市均保证至少可查到往返本省/区域枢纽的航班，不会出现选了城市却查无航班的空结果。后续启动为幂等增量——升级种子数据后，缺失的城市/航班会自动补入，不会重复插入。城市种子依据中国民用航空局颁布的民用运输机场所在地清单生成，未收录无民航机场的地级市。
 
-### 方式二：本地开发（本机 MySQL）
+### 方式二：本地开发（零配置 SQLite）
 
-1. 准备 MySQL，创建数据库与账号：
-
-```sql
-CREATE DATABASE flight_reservation DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER 'flight'@'%' IDENTIFIED BY 'flight123456';
-GRANT ALL PRIVILEGES ON flight_reservation.* TO 'flight'@'%';
-FLUSH PRIVILEGES;
-```
-
-2. 启动后端（首次会自动建表 + 初始化数据）：
+1. 启动后端（首次启动自动建表，数据落在 `backend/flight.db`）：
 
 ```bash
 cd backend
@@ -79,9 +70,9 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
 
-> 配置项在 `backend/config.py` 中均有默认值，**不创建 `.env` 也能直接启动**；需要覆盖时把 `backend/.env.example` 复制为 `.env` 再改。本机未装 Redis 时保持 `REDIS_URL` 为空即可，登录锁定/令牌黑名单/订单号自增自动降级为进程内内存实现，功能一致。
+> 无需安装任何数据库，SQLite 以单文件随项目落盘；删除 `backend/flight.db` 即可重置数据。配置项在 `backend/app/config.py` 中均有默认值，**不创建 `.env` 也能直接启动**；需要覆盖时把 `backend/.env.example` 复制为 `.env` 再改。本机未装 Redis 时保持 `REDIS_URL` 为空即可，登录锁定/令牌黑名单/订单号自增自动降级为进程内内存实现，功能一致。
 
-3. 启动前端：
+2. 启动前端：
 
 ```bash
 cd frontend
@@ -96,7 +87,7 @@ npm run dev
 ```
 flight-reservation/
 ├── README.md
-├── docker-compose.yml          # MySQL + Redis + 后端 + 前端 一键编排
+├── docker-compose.yml          # Redis + 后端 + 前端 一键编排
 ├── .gitignore                  # 排除 .venv / node_modules / dist / .env
 ├── docs/                       # 架构文档与项目说明
 ├── backend/

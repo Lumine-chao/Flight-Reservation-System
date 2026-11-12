@@ -1,12 +1,13 @@
 from datetime import datetime
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from .. import constants, validators
 from ..exceptions import BizException
 from ..models import AdminUser, City, Flight, Order, User
 from ..security import check_password, create_admin_token
-from .order_service import _write_status_log, to_order_out
+from .order_service import _release_seats, _write_status_log, to_order_out
 
 
 def admin_login(db: Session, username: str, password: str) -> dict:
@@ -185,9 +186,15 @@ def admin_handle_order(db: Session, admin: AdminUser, order_no: str, action: str
         raise BizException(3004)
     if order.status != "TICKETED":
         raise BizException(3016)
+    # 取消即释放该单占用的座位，与用户端取消保持同一套库存口径
+    _release_seats(db, order.flight_id, order.ticket_count)
     _write_status_log(db, order, order.status, "CANCELLED", constants.ACTION_ADMIN_CANCEL,
                       constants.OPERATOR_ADMIN, admin.id, remark)
     order.status = "CANCELLED"
     order.updated_at = datetime.now()
-    db.commit()
+    try:
+        db.commit()
+    except StaleDataError:
+        db.rollback()
+        raise BizException(3015)
     return {"orderNo": order.order_no, "status": "CANCELLED"}

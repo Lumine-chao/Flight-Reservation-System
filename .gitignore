@@ -14,6 +14,9 @@ __pycache__/
 
 # 日志与缓存
 *.log
+*.db
+*.db-wal
+*.db-shm
 .pytest_cache/
 .mypy_cache/
 
